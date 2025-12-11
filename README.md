@@ -229,11 +229,22 @@ Manually generates OpenAPI schema and orval client. Use `--watch` to enable auto
 
 Note: you don't need to run this command manually, watcher will run automatically when you start the development server.
 
+### 📝 `shadcn` directory repositories
+
+When the project is initialized, the following directories are added to the `shadcn` directory (via `repositories` key in the `components.json` file):
+
+- https://animate-ui.com/ - for animations. MIT License.
+- https://ai-sdk.dev/ - for AI components (e.g. chat and prompts). Apache-2.0 License.
+- https://svgl.app/docs/shadcn-ui - various SVG icons. MIT License.
+
+We've carefully selected these repositories to ensure that the components are of high quality and are well-maintained.
+
+If you don't want to use these repositories, you can remove them from the `components.json` file.
+
 ## 📜 Project todos
 
+- [x] MCP of apx commands
 - [ ] Add chat template
-- [ ] Add chat template
-- [ ] MCP of apx commands
 - [ ] Add a way to add a custom template
 
 ### License and Third Party Libraries
