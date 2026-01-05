@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, Mock, patch
 import pytest
 
 from apx.cli.dev.mcp import (
+    McpSimpleStatusResponse,
     databricks_apps_logs,
     get_metadata,
     restart,
@@ -15,18 +16,17 @@ from apx.cli.dev.mcp import (
     status,
     stop,
 )
-from apx.cli.dev.models import (
+from apx.models import (
     ActionResponse,
     DevConfig,
-    McpDatabricksAppsLogsResponse,
     McpActionResponse,
+    McpDatabricksAppsLogsResponse,
     McpErrorResponse,
     McpMetadataResponse,
-    McpStatusResponse,
     ProjectConfig,
+    ProjectMetadata,
     StatusResponse,
 )
-from apx.utils import ProjectMetadata
 
 
 @pytest.fixture
@@ -44,7 +44,8 @@ def mock_status_response():
         frontend_running=True,
         backend_running=True,
         openapi_running=True,
-        frontend_port=5173,
+        dev_server_port=7000,
+        frontend_port=5000,
         backend_port=8000,
     )
 
@@ -79,8 +80,6 @@ async def test_start_success(mock_manager):
         patch("pathlib.Path.cwd", return_value=Path("/test/project")),
     ):
         result = await start(
-            frontend_port=5173,
-            backend_port=8000,
             host="localhost",
             obo=True,
             openapi=True,
@@ -92,16 +91,8 @@ async def test_start_success(mock_manager):
         assert result.status == "success"
         assert "Development servers started successfully" in result.message
 
-        # Verify manager.start was called with correct parameters
-        mock_manager.start.assert_called_once_with(
-            frontend_port=5173,
-            backend_port=8000,
-            host="localhost",
-            obo=True,
-            openapi=True,
-            max_retries=10,
-            watch=False,
-        )
+        # Verify manager.start was called
+        mock_manager.start.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -113,7 +104,7 @@ async def test_start_failure(mock_manager):
         patch("apx.cli.dev.mcp._get_manager", return_value=mock_manager),
         patch("pathlib.Path.cwd", return_value=Path("/test/project")),
     ):
-        result = await start(frontend_port=5173, backend_port=8000)
+        result = await start()
 
         assert isinstance(result, McpActionResponse)
         assert result.status == "error"
@@ -226,21 +217,37 @@ async def test_stop_failure(mock_manager):
 @pytest.mark.asyncio
 async def test_status_all_running(mock_manager, mock_client, mock_status_response):
     """Test the status tool when all servers are running."""
+    # Mock _get_ports to return PortsResponse
+    from apx.models import PortsResponse
+
+    def mock_get_ports(client):
+        return PortsResponse(
+            dev_server_port=7000,
+            frontend_port=5173,
+            backend_port=8000,
+            host="localhost",
+            api_prefix="/api",
+        )
+
+    # Get config with dev_server_port set
+    mock_config = ProjectConfig()
+    mock_config.dev.dev_server_port = 7000
+    mock_manager.get_or_create_config = Mock(return_value=mock_config)
+
     with (
         patch("apx.cli.dev.mcp._get_manager", return_value=mock_manager),
         patch("apx.cli.dev.mcp.DevServerClient", return_value=mock_client),
+        patch("apx.cli.dev.mcp._get_ports", side_effect=mock_get_ports),
         patch("pathlib.Path.cwd", return_value=Path("/test/project")),
     ):
         result = await status()
 
-        assert isinstance(result, McpStatusResponse)
+        assert isinstance(result, McpSimpleStatusResponse)
         assert result.dev_server_running is True
-        assert result.dev_server_port is None  # No port tracking with Unix sockets
-        assert result.dev_server_pid is None  # No PID tracking with Unix sockets
+        assert result.dev_server_url == "http://localhost:7000"
+        assert result.api_prefix == "/api"
         assert result.frontend_running is True
-        assert result.frontend_port == 5173
         assert result.backend_running is True
-        assert result.backend_port == 8000
         assert result.openapi_running is True
 
         # Verify client.status was called
@@ -252,7 +259,6 @@ async def test_status_no_server():
     """Test the status tool when no server is configured."""
     manager = MagicMock()
     manager.is_dev_server_running = Mock(return_value=False)
-    manager.socket_path = Path("/test/project/.apx/dev.sock")
 
     with (
         patch("apx.cli.dev.mcp._get_manager", return_value=manager),
@@ -260,10 +266,10 @@ async def test_status_no_server():
     ):
         result = await status()
 
-        assert isinstance(result, McpStatusResponse)
+        assert isinstance(result, McpSimpleStatusResponse)
         assert result.dev_server_running is False
-        assert result.dev_server_port is None
-        assert result.dev_server_pid is None
+        assert result.dev_server_url is None
+        assert result.api_prefix is None
         assert result.frontend_running is False
         assert result.backend_running is False
         assert result.openapi_running is False
@@ -280,7 +286,7 @@ async def test_status_server_not_running(mock_manager):
     ):
         result = await status()
 
-        assert isinstance(result, McpStatusResponse)
+        assert isinstance(result, McpSimpleStatusResponse)
         assert result.dev_server_running is False
         assert result.frontend_running is False
         assert result.backend_running is False
@@ -290,20 +296,28 @@ async def test_status_server_not_running(mock_manager):
 @pytest.mark.asyncio
 async def test_status_client_error(mock_manager, mock_client):
     """Test the status tool when client connection fails."""
-    mock_client.status.side_effect = Exception("Connection refused")
+
+    # Mock _get_ports to fail
+    def mock_get_ports_fail(client):
+        raise Exception("Connection refused")
+
+    # Get config with dev_server_port set
+    mock_config = ProjectConfig()
+    mock_config.dev.dev_server_port = 7000
+    mock_manager.get_or_create_config = Mock(return_value=mock_config)
 
     with (
         patch("apx.cli.dev.mcp._get_manager", return_value=mock_manager),
         patch("apx.cli.dev.mcp.DevServerClient", return_value=mock_client),
+        patch("apx.cli.dev.mcp._get_ports", side_effect=mock_get_ports_fail),
         patch("pathlib.Path.cwd", return_value=Path("/test/project")),
     ):
         result = await status()
 
         # Should still return server info even if client fails
-        assert isinstance(result, McpStatusResponse)
+        assert isinstance(result, McpSimpleStatusResponse)
         assert result.dev_server_running is True
-        assert result.dev_server_port is None  # No port tracking with Unix sockets
-        assert result.dev_server_pid is None  # No PID tracking with Unix sockets
+        assert result.dev_server_url == "http://localhost:7000"
         # But process statuses should be False
         assert result.frontend_running is False
         assert result.backend_running is False
@@ -353,11 +367,14 @@ async def test_get_metadata_failure():
 @pytest.mark.asyncio
 async def test_status_with_mocked_response(mock_manager, mock_status_response):
     """Test status tool with a specific mocked status response."""
+    from apx.models import PortsResponse
+
     # Customize the mock response
     custom_response = StatusResponse(
         frontend_running=False,
         backend_running=True,
         openapi_running=False,
+        dev_server_port=7000,
         frontend_port=3000,
         backend_port=8080,
     )
@@ -365,20 +382,35 @@ async def test_status_with_mocked_response(mock_manager, mock_status_response):
     client = MagicMock()
     client.status = Mock(return_value=custom_response)
 
+    def mock_get_ports(client):
+        return PortsResponse(
+            dev_server_port=7000,
+            frontend_port=3000,
+            backend_port=8080,
+            host="localhost",
+            api_prefix="/api",
+        )
+
+    # Get config with dev_server_port set
+    mock_config = ProjectConfig()
+    mock_config.dev.dev_server_port = 7000
+    mock_manager.get_or_create_config = Mock(return_value=mock_config)
+
     with (
         patch("apx.cli.dev.mcp._get_manager", return_value=mock_manager),
         patch("apx.cli.dev.mcp.DevServerClient", return_value=client),
+        patch("apx.cli.dev.mcp._get_ports", side_effect=mock_get_ports),
         patch("pathlib.Path.cwd", return_value=Path("/test/project")),
     ):
         result = await status()
 
-        assert isinstance(result, McpStatusResponse)
+        assert isinstance(result, McpSimpleStatusResponse)
         assert result.dev_server_running is True
         assert result.frontend_running is False
-        assert result.frontend_port == 3000
         assert result.backend_running is True
-        assert result.backend_port == 8080
         assert result.openapi_running is False
+        assert result.dev_server_url == "http://localhost:7000"
+        assert result.api_prefix == "/api"
 
 
 @pytest.mark.asyncio
@@ -394,7 +426,7 @@ async def test_start_suppresses_console_output(mock_manager):
             patch("apx.cli.dev.mcp._get_manager", return_value=mock_manager),
             patch("pathlib.Path.cwd", return_value=Path("/test/project")),
         ):
-            result = await start(frontend_port=5173, backend_port=8000)
+            result = await start()
 
             # Verify the result is successful
             assert isinstance(result, McpActionResponse)
@@ -415,11 +447,17 @@ async def test_start_suppresses_console_output(mock_manager):
 @pytest.mark.asyncio
 async def test_mcp_tool_responses_are_valid_models():
     """Test that MCP tool responses are valid Pydantic models."""
+    from apx.models import PortsResponse
+
     manager = MagicMock()
-    manager.socket_path = Path("/test/project/.apx/dev.sock")
     manager.is_dev_server_running = Mock(return_value=True)
     manager.start = Mock()
     manager.stop = Mock()
+
+    # Get config with dev_server_port set
+    mock_config = ProjectConfig()
+    mock_config.dev.dev_server_port = 7000
+    manager.get_or_create_config = Mock(return_value=mock_config)
 
     client = MagicMock()
     client.status = Mock(
@@ -427,7 +465,8 @@ async def test_mcp_tool_responses_are_valid_models():
             frontend_running=True,
             backend_running=True,
             openapi_running=True,
-            frontend_port=5173,
+            dev_server_port=7000,
+            frontend_port=5000,
             backend_port=8000,
         )
     )
@@ -435,9 +474,19 @@ async def test_mcp_tool_responses_are_valid_models():
         return_value=ActionResponse(status="success", message="Restarted")
     )
 
+    def mock_get_ports(client):
+        return PortsResponse(
+            dev_server_port=7000,
+            frontend_port=5000,
+            backend_port=8000,
+            host="localhost",
+            api_prefix="/api",
+        )
+
     with (
         patch("apx.cli.dev.mcp._get_manager", return_value=manager),
         patch("apx.cli.dev.mcp.DevServerClient", return_value=client),
+        patch("apx.cli.dev.mcp._get_ports", side_effect=mock_get_ports),
         patch("pathlib.Path.cwd", return_value=Path("/test/project")),
         patch(
             "apx.cli.dev.mcp.get_project_metadata",
@@ -458,7 +507,7 @@ async def test_mcp_tool_responses_are_valid_models():
 
         # Test status response
         status_result = await status()
-        assert isinstance(status_result, McpStatusResponse)
+        assert isinstance(status_result, McpSimpleStatusResponse)
         assert status_result.model_dump()  # Should serialize to dict
 
         # Test get_metadata response

@@ -1,20 +1,20 @@
-from enum import Enum
-from importlib import resources
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import time
-
+from importlib import resources
+from pathlib import Path
 from typing import Annotated
-from dotenv import set_key
+
 import jinja2
+from dotenv import set_key
 from rich import print
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.prompt import Confirm, Prompt
 from typer import Argument, Exit, Option
 
 from apx.cli.version import with_version
+from apx.models import Assistant, Layout, Template
 from apx.utils import (
     console,
     ensure_dir,
@@ -60,44 +60,6 @@ def bun_add(
     # Add packages
     cmd.extend(packages)
     run_subprocess(cmd, cwd=cwd, error_msg=error_msg)
-
-
-class Template(str, Enum):
-    essential = "essential"
-    stateful = "stateful"
-
-    @classmethod
-    def from_string(cls, value: str) -> "Template":
-        try:
-            return cls(value.lower())
-        except ValueError:
-            raise ValueError(f"Invalid template: {value}")
-
-
-class Assistant(str, Enum):
-    cursor = "cursor"
-    vscode = "vscode"
-    codex = "codex"
-    claude = "claude"
-
-    @classmethod
-    def from_string(cls, value: str) -> "Assistant":
-        try:
-            return cls(value.lower())
-        except ValueError:
-            raise ValueError(f"Invalid assistant: {value}")
-
-
-class Layout(str, Enum):
-    basic = "basic"
-    sidebar = "sidebar"
-
-    @classmethod
-    def from_string(cls, value: str) -> "Layout":
-        try:
-            return cls(value.lower())
-        except ValueError:
-            raise ValueError(f"Invalid layout: {value}")
 
 
 def add_bun_dependencies(cwd: Path) -> None:
@@ -224,6 +186,27 @@ def init(
             "-apx-e",
             hidden=True,
             help="Whether to install apx as editable package.",
+        ),
+    ] = False,
+    skip_frontend_dependencies: Annotated[
+        bool,
+        Option(
+            "--skip-frontend-dependencies",
+            help="Skip installing frontend dependencies (bun packages).",
+        ),
+    ] = False,
+    skip_backend_dependencies: Annotated[
+        bool,
+        Option(
+            "--skip-backend-dependencies",
+            help="Skip installing backend dependencies (uv sync).",
+        ),
+    ] = False,
+    skip_build: Annotated[
+        bool,
+        Option(
+            "--skip-build",
+            help="Skip building the project after initialization.",
         ),
     ] = False,
 ):
@@ -373,36 +356,39 @@ def init(
             )
 
     # === PHASE 2: Installing frontend dependencies ===
-    with progress_spinner(
-        "📦 Installing frontend dependencies...", "✅ Frontend dependencies installed"
-    ):
-        # Install bun main dependencies
-        add_bun_dependencies(app_path)
+    if not skip_frontend_dependencies:
+        with progress_spinner(
+            "📦 Installing frontend dependencies...",
+            "✅ Frontend dependencies installed",
+        ):
+            # Install bun main dependencies
+            add_bun_dependencies(app_path)
 
-        # Install bun dev dependencies
-        add_bun_dev_dependencies(app_path)
+            # Install bun dev dependencies
+            add_bun_dev_dependencies(app_path)
 
     # === PHASE 3: Bootstrapping shadcn ===
-    with progress_spinner(
-        "🎨 Bootstrapping shadcn components...", "✅ Shadcn components added"
-    ):
-        # Add button component
-        add_shadcn_components(app_path, ["button"])
+    if not skip_frontend_dependencies:
+        with progress_spinner(
+            "🎨 Bootstrapping shadcn components...", "✅ Shadcn components added"
+        ):
+            # Add button component
+            add_shadcn_components(app_path, ["button"])
 
-        if layout == Layout.sidebar:
-            # install necessary components for sidebar layout
-            add_shadcn_components(
-                app_path,
-                [
-                    "avatar",
-                    "sidebar",
-                    "separator",
-                    "skeleton",
-                    "badge",
-                    "sidebar",
-                    "card",
-                ],
-            )
+            if layout == Layout.sidebar:
+                # install necessary components for sidebar layout
+                add_shadcn_components(
+                    app_path,
+                    [
+                        "avatar",
+                        "sidebar",
+                        "separator",
+                        "skeleton",
+                        "badge",
+                        "sidebar",
+                        "card",
+                    ],
+                )
 
     # === PHASE 4: Initializing git ===
     with progress_spinner(
@@ -425,25 +411,85 @@ def init(
         )
 
     # === PHASE 5: Syncing project with uv ===
-    phase_start = time.perf_counter()
-    with Progress(
-        SpinnerColumn(finished_text=""),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-        transient=True,
-    ) as progress:
-        task = progress.add_task("🐍 Setting up project...", total=None)
+    if not skip_backend_dependencies:
+        phase_start = time.perf_counter()
+        with Progress(
+            SpinnerColumn(finished_text=""),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+            transient=True,
+        ) as progress:
+            task = progress.add_task("🐍 Setting up project...", total=None)
 
-        # Generate the _metadata.py file
-        generate_metadata_file(app_path)
-        # add apx package:
-        if apx_package:
-            base_cmd = ["uv", "add", "--dev"]
-            if apx_editable:
-                base_cmd.append("--editable")
-            final_cmd = base_cmd + [apx_package]
+            # Generate the _metadata.py file
+            generate_metadata_file(app_path)
+            # add apx package:
+            if apx_package:
+                base_cmd = ["uv", "add", "--dev"]
+                if apx_editable:
+                    base_cmd.append("--editable")
+                final_cmd = base_cmd + [apx_package]
+                result = subprocess.run(
+                    final_cmd,
+                    cwd=app_path,
+                    capture_output=True,
+                    text=True,
+                    env=os.environ,
+                )
+
+                if result.returncode != 0:
+                    console.print("[red]❌ Failed to add apx package[/red]")
+                    if result.stderr:
+                        console.print(f"[red]{result.stderr}[/red]")
+                    if result.stdout:
+                        console.print(f"[red]{result.stdout}[/red]")
+                    raise Exit(code=1)
+
+            # Start uv sync in background
+            proc = subprocess.Popen(
+                ["uv", "sync"],
+                cwd=app_path,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            # Monitor progress for up to 10 seconds
+            start_time = time.time()
+            warning_shown = False
+
+            while proc.poll() is None:
+                elapsed = time.time() - start_time
+                if elapsed >= 10 and not warning_shown:
+                    progress.update(
+                        task,
+                        description="🐍 Setting up project (taking longer than expected)...",
+                    )
+                    warning_shown = True
+                time.sleep(0.1)
+
+            # Get the result
+            stdout, stderr = proc.communicate()
+
+            if proc.returncode != 0:
+                console.print("[red]❌ Failed to set up project[/red]")
+                if stderr:
+                    console.print(f"[red]{stderr}[/red]")
+                if stdout:
+                    console.print(f"[red]{stdout}[/red]")
+                raise Exit(code=1)
+
+        console.print(f"✅ Project set up ({format_elapsed_ms(phase_start)})")
+
+    # === PHASE 6: Build using apx build ===
+
+    # we're using the uv command because it needs to run the build command
+    # in the virtual environment of the project, not the global one
+
+    if not skip_build:
+        with progress_spinner("🔧 Building project...", "✅ Project built"):
             result = subprocess.run(
-                final_cmd,
+                ["uv", "run", "apx", "build"],
                 cwd=app_path,
                 capture_output=True,
                 text=True,
@@ -451,62 +497,12 @@ def init(
             )
 
             if result.returncode != 0:
-                console.print("[red]❌ Failed to add apx package[/red]")
+                console.print("[red]❌ Failed to build project[/red]")
                 if result.stderr:
                     console.print(f"[red]{result.stderr}[/red]")
                 if result.stdout:
                     console.print(f"[red]{result.stdout}[/red]")
                 raise Exit(code=1)
-
-        # Start uv sync in background
-        proc = subprocess.Popen(
-            ["uv", "sync"],
-            cwd=app_path,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-
-        # Monitor progress for up to 10 seconds
-        start_time = time.time()
-        warning_shown = False
-
-        while proc.poll() is None:
-            elapsed = time.time() - start_time
-            if elapsed >= 10 and not warning_shown:
-                progress.update(
-                    task,
-                    description="🐍 Setting up project (taking longer than expected)...",
-                )
-                warning_shown = True
-            time.sleep(0.1)
-
-        # Get the result
-        stdout, stderr = proc.communicate()
-
-        if proc.returncode != 0:
-            console.print("[red]❌ Failed to set up project[/red]")
-            if stderr:
-                console.print(f"[red]{stderr}[/red]")
-            if stdout:
-                console.print(f"[red]{stdout}[/red]")
-            raise Exit(code=1)
-
-    console.print(f"✅ Project set up ({format_elapsed_ms(phase_start)})")
-
-    # === PHASE 6: Build using apx build ===
-
-    # we're using the uv command because it needs to run the build command
-    # in the virtual environment of the project, not the global one
-
-    with progress_spinner("🔧 Building project...", "✅ Project built"):
-        subprocess.run(
-            ["uv", "run", "apx", "build"],
-            cwd=app_path,
-            capture_output=True,
-            text=True,
-            env=os.environ,
-        )
 
     # === PHASE 7: Setting up assistant rules ===
     if assistant:
@@ -560,5 +556,5 @@ def init(
         f"[bold green]✨ Project {app_name} initialized successfully! [/bold green]"
     )
     console.print(
-        f"[bold green]🚀 Run `cd {app_path.resolve()} && uv run apx dev` to get started![/bold green]"
+        f"[bold green]🚀 Run `cd {app_path.resolve()} && uv run apx dev start` to get started![/bold green]"
     )

@@ -2,20 +2,24 @@
 
 import asyncio
 import json
-import logging
-import psutil
+import os
+import signal
 import socket
 import subprocess
 import time
-import os
-import signal
+import traceback
 from pathlib import Path
 from typing import Any, Literal
 
 import keyring
+import psutil
+from rich.status import Status
+import uvicorn
+import watchfiles
 from databricks.sdk import WorkspaceClient
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from rich.table import Table
 from starlette.middleware.base import BaseHTTPMiddleware
 from tenacity import (
@@ -26,45 +30,59 @@ from tenacity import (
     wait_exponential,
 )
 from typer import Exit
-import watchfiles
-import uvicorn
-from apx.cli.dev.models import ActionRequest, LogEntry, ProjectConfig
-from apx.cli.dev.client import DevServerClient, StreamEvent
-from apx.cli.dev.logging import (
-    setup_uvicorn_logging,
-    suppress_output_and_logs,
-    print_log_entry,
-)
-from apx.cli.dev.reloader import load_app as _load_app_from_reloader
-from apx.utils import (
-    console,
-    ensure_dir,
-)
+
 from apx import __version__
+from apx.cli.dev.client import DevServerClient
+from apx.cli.dev.logging import (
+    DevLogComponent,
+    get_logger,
+    log_channel,
+    print_log_entry,
+    reset_log_channel,
+    set_log_channel,
+    suppress_output_and_logs,
+)
 from apx.cli.dev.process_control import (
-    TrackedProcess,
     cleanup_dev_server_processes,
     find_listeners_for_port,
-    kill_pids,
-    pids_belong_to_app,
     stop_tracked_process,
     track_process,
     wait_for_no_descendants,
     wait_for_port_free,
 )
-from apx.cli.dev.models import DevProcessInfo
-from apx.cli.dev.state_types import FrontendProcessState
-
-
-# note: header name must be lowercase and with - symbols
-ACCESS_TOKEN_HEADER_NAME = "x-forwarded-access-token"
-FORWARDED_USER_HEADER_NAME = "x-forwarded-user"
+from apx.cli.dev.reloader import load_app as _load_app_from_reloader
+from apx.constants import (
+    ACCESS_TOKEN_HEADER_NAME,
+    BACKEND_PORT_END,
+    BACKEND_PORT_START,
+    DEV_SERVER_PORT_END,
+    DEV_SERVER_PORT_START,
+    FORWARDED_USER_HEADER_NAME,
+    FRONTEND_PORT_END,
+    FRONTEND_PORT_START,
+)
+from apx.models import (
+    ActionRequest,
+    DevServerConfig,
+    FrontendProcessState,
+    LogChannel,
+    LogEntry,
+    PortsConfig,
+    ProjectConfig,
+    StreamEvent,
+)
+from apx.utils import (
+    console,
+    ensure_dir,
+)
 
 
 # === Port Finding Utilities ===
 
 
-def is_port_available(port: int, host: str = "127.0.0.1") -> bool:
+def is_port_available(
+    port: int, host: str = "127.0.0.1", *, allow_reuse: bool = False
+) -> bool:
     """Check if a port is available for binding.
 
     Uses multiple strategies to detect if a port is in use:
@@ -75,6 +93,10 @@ def is_port_available(port: int, host: str = "127.0.0.1") -> bool:
     Args:
         port: Port number to check
         host: Host to check on (default: 127.0.0.1)
+        allow_reuse: If True, use SO_REUSEADDR when checking bind availability.
+                    This allows detecting ports in TIME_WAIT as available,
+                    matching what uvicorn does when actually binding.
+                    Use this for restart scenarios.
 
     Returns:
         True if port is available, False otherwise
@@ -105,13 +127,19 @@ def is_port_available(port: int, host: str = "127.0.0.1") -> bool:
     # Strategy 2: Try binding to both IPv4 and IPv6 addresses
     # A server can bind to either, so we must check both
 
+    # Determine SO_REUSEADDR setting based on allow_reuse
+    # When allow_reuse=True, we set SO_REUSEADDR=1 to match uvicorn's behavior,
+    # which allows binding to ports in TIME_WAIT state.
+    reuse_addr_value = 1 if allow_reuse else 0
+
     # Check IPv4: Try binding to BOTH 127.0.0.1 and 0.0.0.0
     for bind_host in ["127.0.0.1", "0.0.0.0"]:
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                # Don't set SO_REUSEADDR - we want to know if it's actually in use
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
-                # Set SO_REUSEPORT to 0 as well on systems that support it
+                sock.setsockopt(
+                    socket.SOL_SOCKET, socket.SO_REUSEADDR, reuse_addr_value
+                )
+                # Set SO_REUSEPORT to 0 on systems that support it
                 if hasattr(socket, "SO_REUSEPORT"):
                     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 0)
                 sock.bind((bind_host, port))
@@ -129,9 +157,10 @@ def is_port_available(port: int, host: str = "127.0.0.1") -> bool:
     for bind_host in ["::1", "::"]:
         try:
             with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as sock:
-                # Don't set SO_REUSEADDR - we want to know if it's actually in use
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
-                # Set SO_REUSEPORT to 0 as well on systems that support it
+                sock.setsockopt(
+                    socket.SOL_SOCKET, socket.SO_REUSEADDR, reuse_addr_value
+                )
+                # Set SO_REUSEPORT to 0 on systems that support it
                 if hasattr(socket, "SO_REUSEPORT"):
                     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 0)
                 sock.bind((bind_host, port))
@@ -147,26 +176,35 @@ def is_port_available(port: int, host: str = "127.0.0.1") -> bool:
 
     # Strategy 3: Check system network connections as a fallback
     # This catches servers that might be in TIME_WAIT or other states
-    # Check both IPv4 and IPv6 connections
-    try:
-        for conn in psutil.net_connections(kind="inet"):
-            if hasattr(conn, "laddr") and conn.laddr and hasattr(conn.laddr, "port"):
-                if conn.laddr.port == port:
-                    # Port is in use by some process
-                    return False
-    except (psutil.AccessDenied, PermissionError, AttributeError):
-        # If we can't check, be conservative and rely on bind test results
-        pass
+    # Skip this check when allow_reuse=True since TIME_WAIT is acceptable
+    if not allow_reuse:
+        try:
+            for conn in psutil.net_connections(kind="inet"):
+                if (
+                    hasattr(conn, "laddr")
+                    and conn.laddr
+                    and hasattr(conn.laddr, "port")
+                ):
+                    if conn.laddr.port == port:
+                        # Port is in use by some process
+                        return False
+        except (psutil.AccessDenied, PermissionError, AttributeError):
+            # If we can't check, be conservative and rely on bind test results
+            pass
 
-    try:
-        for conn in psutil.net_connections(kind="inet6"):
-            if hasattr(conn, "laddr") and conn.laddr and hasattr(conn.laddr, "port"):
-                if conn.laddr.port == port:
-                    # Port is in use by some process
-                    return False
-    except (psutil.AccessDenied, PermissionError, AttributeError):
-        # If we can't check, be conservative and rely on bind test results
-        pass
+        try:
+            for conn in psutil.net_connections(kind="inet6"):
+                if (
+                    hasattr(conn, "laddr")
+                    and conn.laddr
+                    and hasattr(conn.laddr, "port")
+                ):
+                    if conn.laddr.port == port:
+                        # Port is in use by some process
+                        return False
+        except (psutil.AccessDenied, PermissionError, AttributeError):
+            # If we can't check, be conservative and rely on bind test results
+            pass
 
     return True
 
@@ -186,24 +224,6 @@ def find_available_port(start: int, end: int, host: str = "127.0.0.1") -> int | 
         if is_port_available(port, host):
             return port
     return None
-
-
-# === Retry Helpers ===
-
-
-def log_retry_attempt(retry_state: RetryCallState) -> None:
-    """Log retry attempts to the appropriate logger.
-
-    Args:
-        retry_state: Tenacity retry state
-    """
-    attempt_number = retry_state.attempt_number
-    if retry_state.outcome and retry_state.outcome.failed:
-        exception = retry_state.outcome.exception()
-        logger = logging.getLogger("apx.retry")
-        logger.error(
-            f"Attempt {attempt_number} failed with error: {exception}. Retrying..."
-        )
 
 
 # === Project Configuration Utilities ===
@@ -329,7 +349,7 @@ def prepare_obo_token(
     cwd: Path,
     app_module_name: str,
     token_lifetime_seconds: int = 60 * 60 * 4,
-    status_context=None,
+    status_context: Status | None = None,
 ) -> str:
     """Prepare the On-Behalf-Of token for the backend server.
 
@@ -437,42 +457,27 @@ async def run_backend(
         max_retries: Maximum number of retry attempts
     """
 
-    # Setup uvicorn logging once at the start
-    # If log_file is None, we're in dev_server mode and use memory logging
     use_memory = log_file is None
-    setup_uvicorn_logging(use_memory=use_memory)
-
-    # Setup retry logger
-    retry_logger = logging.getLogger("apx.retry")
-    retry_logger.setLevel(logging.INFO)
-    retry_logger.handlers.clear()
-
-    if use_memory:
-        # Use the backend logger that's already configured
-        backend_logger = logging.getLogger("apx.backend")
-        if backend_logger.handlers:
-            retry_logger.addHandler(backend_logger.handlers[0])
-    else:
-        # Console mode - use uvicorn handler
-        uvicorn_logger = logging.getLogger("uvicorn")
-        if uvicorn_logger.handlers:
-            retry_logger.addHandler(uvicorn_logger.handlers[0])
-
-    retry_logger.propagate = False
+    backend_logger = get_logger(DevLogComponent.BACKEND)
 
     # Note: stdout/stderr redirection is handled in dev_server.py lifespan
     # before any tasks start, so we don't need to do it here.
 
+    def _log_retry_backend(retry_state: RetryCallState) -> None:
+        if retry_state.outcome and retry_state.outcome.failed:
+            exception = retry_state.outcome.exception()
+            backend_logger.error(
+                f"Attempt {retry_state.attempt_number} failed with error: {exception}. Retrying..."
+            )
+
     @retry(
         stop=stop_after_attempt(max_retries),
         wait=wait_exponential(multiplier=1, min=2, max=60),
-        before_sleep=log_retry_attempt,
+        before_sleep=_log_retry_backend,
         reraise=True,
     )
-    async def run_backend_with_retry():
+    async def run_backend_with_retry() -> None:
         """Backend runner with retry logic."""
-        backend_logger = logging.getLogger("uvicorn")
-
         if use_memory:
             backend_logger.info(f"Starting backend server on {host}:{backend_port}")
         else:
@@ -573,16 +578,56 @@ async def run_backend(
                         BaseHTTPMiddleware, dispatch=obo_middleware
                     )
 
+                # Add catch-all exception handler to log exceptions before
+                # ServerErrorMiddleware swallows them. Exception handlers are
+                # called BEFORE ServerErrorMiddleware, so we can log the full
+                # traceback before it's converted to a 500 response.
+                async def _dev_exception_handler(
+                    request: Request, exc: Exception
+                ) -> JSONResponse:
+                    # Print to stderr which is captured by ContextualStreamWriter
+                    # and routed to the [app] channel based on the context.
+                    import sys
+
+                    traceback.print_exception(
+                        type(exc), exc, exc.__traceback__, file=sys.stderr
+                    )
+                    return JSONResponse(
+                        status_code=500, content={"detail": "Internal Server Error"}
+                    )
+
+                app_instance.add_exception_handler(Exception, _dev_exception_handler)
+
+                # Add context middleware to set LogChannel.APP per-request.
+                # This ensures the context variable is set correctly for each
+                # request, regardless of how uvicorn spawns request handlers.
+                # Added LAST so it runs FIRST (outermost layer).
+                async def channel_context_middleware(request: Request, call_next):
+                    token = set_log_channel(LogChannel.APP)
+                    try:
+                        return await call_next(request)
+                    finally:
+                        reset_log_channel(token)
+
+                app_instance.add_middleware(
+                    BaseHTTPMiddleware, dispatch=channel_context_middleware
+                )
+
                 if first_run:
                     console.print()
 
-                config = uvicorn.Config(
-                    app=app_instance,
-                    host=host,
-                    port=backend_port,
-                    log_level="info",
-                    log_config=None,  # Disable uvicorn's default log config
-                )
+                config_kwargs: dict[str, Any] = {
+                    "app": app_instance,
+                    "host": host,
+                    "port": backend_port,
+                    "log_level": "debug",
+                }
+                if use_memory:
+                    # Disable uvicorn's default log config in dev-server mode.
+                    # The dev server configures routing for uvicorn.* loggers.
+                    config_kwargs["log_config"] = None
+
+                config = uvicorn.Config(**config_kwargs)
 
                 server = uvicorn.Server(config)
                 first_run = False
@@ -590,7 +635,13 @@ async def run_backend(
                 # Start server in a background task
                 async def serve(server_instance: uvicorn.Server):
                     try:
-                        await server_instance.serve()
+                        if use_memory:
+                            from apx.models import LogChannel
+
+                            with log_channel(LogChannel.APP):
+                                await server_instance.serve()
+                        else:
+                            await server_instance.serve()
                     except asyncio.CancelledError:
                         pass
 
@@ -796,21 +847,19 @@ async def run_frontend_with_logging(
         max_retries: Maximum number of retry attempts
         state: Optional ServerState object to store process reference
     """
-    # Use the already-configured logger (set up by dev_server)
-    logger = logging.getLogger("apx.frontend")
+    logger = get_logger(DevLogComponent.UI)
 
-    # Setup retry logger to use same handler
-    retry_logger = logging.getLogger("apx.retry")
-    retry_logger.setLevel(logging.INFO)
-    retry_logger.handlers.clear()
-    if logger.handlers:
-        retry_logger.addHandler(logger.handlers[0])
-    retry_logger.propagate = False
+    def _log_retry_frontend(retry_state: RetryCallState) -> None:
+        if retry_state.outcome and retry_state.outcome.failed:
+            exception = retry_state.outcome.exception()
+            logger.error(
+                f"Attempt {retry_state.attempt_number} failed with error: {exception}. Retrying..."
+            )
 
     @retry(
         stop=stop_after_attempt(max_retries),
         wait=wait_exponential(multiplier=1, min=2, max=60),
-        before_sleep=log_retry_attempt,
+        before_sleep=_log_retry_frontend,
         retry=retry_if_not_exception_type(RuntimeError),
         reraise=True,
     )
@@ -826,6 +875,10 @@ async def run_frontend_with_logging(
         else:
             start_new_session = True
 
+        # Pass port configuration via environment variables for Vite
+        env = os.environ.copy()
+        env["APX_FRONTEND_PORT"] = str(port)
+
         process = await asyncio.create_subprocess_exec(
             "bun",
             "run",
@@ -835,6 +888,7 @@ async def run_frontend_with_logging(
             stderr=asyncio.subprocess.PIPE,
             start_new_session=start_new_session,
             creationflags=creationflags,
+            env=env,
         )
 
         # Store process reference in state if provided
@@ -890,23 +944,21 @@ async def run_openapi_with_logging(app_dir: Path, max_retries: int = 10):
         app_dir: Application directory
         max_retries: Maximum number of retry attempts
     """
-    from apx.openapi import _openapi_watch
+    from apx.cli.openapi import create_api_generator
 
-    # Use the already-configured logger (set up by dev_server)
-    logger = logging.getLogger("apx.openapi")
+    logger = get_logger(DevLogComponent.OPENAPI)
 
-    # Setup retry logger to use same handler
-    retry_logger = logging.getLogger("apx.retry")
-    retry_logger.setLevel(logging.INFO)
-    retry_logger.handlers.clear()
-    if logger.handlers:
-        retry_logger.addHandler(logger.handlers[0])
-    retry_logger.propagate = False
+    def _log_retry_openapi(retry_state: RetryCallState) -> None:
+        if retry_state.outcome and retry_state.outcome.failed:
+            exception = retry_state.outcome.exception()
+            logger.error(
+                f"Attempt {retry_state.attempt_number} failed with error: {exception}. Retrying..."
+            )
 
     @retry(
         stop=stop_after_attempt(max_retries),
         wait=wait_exponential(multiplier=1, min=2, max=60),
-        before_sleep=log_retry_attempt,
+        before_sleep=_log_retry_openapi,
         reraise=True,
     )
     async def run_with_retry():
@@ -916,8 +968,8 @@ async def run_openapi_with_logging(app_dir: Path, max_retries: int = 10):
         # Note: We don't redirect stdout/stderr here because the backend process
         # already handles that. The OpenAPI watcher uses the logger directly.
         try:
-            # Run the OpenAPI watcher with logger
-            await _openapi_watch(app_dir, logger=logger)
+            generator = create_api_generator(app_dir, logger=logger)
+            await generator.watch()
         except Exception as e:
             logger.error(f"OpenAPI watcher failed: {e}")
             raise
@@ -941,7 +993,6 @@ class DevManager:
         self.app_dir: Path = app_dir
         self.apx_dir: Path = app_dir / ".apx"
         self.project_json_path: Path = self.apx_dir / "project.json"
-        self.socket_path: Path = self.apx_dir / "dev.sock"
 
     def get_or_create_config(self) -> ProjectConfig:
         """Get or create project configuration."""
@@ -958,31 +1009,44 @@ class DevManager:
         write_project_config(self.project_json_path, config)
         return config
 
+    def _get_dev_server_port(self) -> int | None:
+        """Get the dev server port from project.json."""
+        try:
+            config = self.get_or_create_config()
+            return config.dev.dev_server_port
+        except Exception:
+            return None
+
     def is_dev_server_running(self) -> bool:
-        """Check if the dev server is running by checking socket existence."""
-        return self.socket_path.exists()
+        """Check if the dev server is running by attempting to connect."""
+        port = self._get_dev_server_port()
+        if port is None:
+            return False
+
+        try:
+            client = DevServerClient(port=port, timeout=2.0)
+            return client.is_running()
+        except Exception:
+            return False
 
     def start(
         self,
-        frontend_port: int = 5173,
-        backend_port: int = 8000,
-        host: str = "localhost",
-        obo: bool = True,
-        openapi: bool = True,
-        max_retries: int = 10,
-        watch: bool = False,
+        config: DevServerConfig | None = None,
+        preferred_ports: PortsConfig | None = None,
     ):
         """Start development server in detached mode.
 
         Args:
-            frontend_port: Port for the frontend development server
-            backend_port: Port for the backend server
-            host: Host for dev, frontend, and backend servers
-            obo: Whether to add On-Behalf-Of header to the backend server
-            openapi: Whether to start OpenAPI watcher process
-            max_retries: Maximum number of retry attempts for processes
-            watch: Whether in watch mode or detached mode
+            config: Development server configuration. If not provided, uses defaults.
+                   Ports will be automatically discovered and updated in the config.
+            preferred_ports: Optional preferred ports to try first (e.g., from a previous session).
+                            If these ports are available, they will be used; otherwise falls back
+                            to finding new ports.
         """
+        # Use default config if none provided
+        if config is None:
+            config = DevServerConfig()
+
         # Check if dev server is already running
         if self.is_dev_server_running():
             console.print(
@@ -990,129 +1054,110 @@ class DevManager:
             )
             raise Exit(code=1)
 
-        # If we have previous process metadata in project.json, we only stop processes we tracked.
-        # This avoids kill-by-name cleanups that might terminate unrelated processes.
-        config = self.get_or_create_config()
-        if config.dev.frontend_process or config.dev.dev_server_process:
+        # Clean up stale dev server if port is in config but server not responding
+        project_config = self.get_or_create_config()
+        if project_config.dev.dev_server_pid is not None:
             console.print(
-                "[cyan]🧹 Found previous dev session state; attempting safe cleanup of tracked processes...[/cyan]"
+                "[cyan]🧹 Found previous dev session state; attempting safe cleanup...[/cyan]"
             )
-            # Prefer pgid-based shutdown (works even if bun pid is gone).
-            if config.dev.frontend_process:
+            tp = track_process(project_config.dev.dev_server_pid)
+            if tp is not None:
                 stop_tracked_process(
-                    TrackedProcess(
-                        pid=config.dev.frontend_process.pid,
-                        create_time=config.dev.frontend_process.create_time,
-                        pgid=config.dev.frontend_process.pgid,
-                    ),
-                    name="frontend",
-                    sigint_timeout=0.2,
-                    sigterm_timeout=0.6,
-                    sigkill_timeout=0.6,
-                )
-                wait_for_no_descendants(
-                    TrackedProcess(
-                        pid=config.dev.frontend_process.pid,
-                        create_time=config.dev.frontend_process.create_time,
-                        pgid=config.dev.frontend_process.pgid,
-                    ),
-                    timeout=2.0,
-                    poll=0.1,
-                )
-
-                # Port-aware last resort: if the previous frontend port is still held,
-                # kill only listener PIDs that look like they belong to this app.
-                if config.dev.frontend_port is not None:
-                    if not wait_for_port_free(
-                        is_port_available_fn=is_port_available,
-                        port=config.dev.frontend_port,
-                        timeout=1.5,
-                        poll=0.1,
-                    ):
-                        listeners = find_listeners_for_port(config.dev.frontend_port)
-                        to_kill = pids_belong_to_app(
-                            listeners,
-                            app_dir=self.app_dir,
-                            expected_pgid=config.dev.frontend_process.pgid,
-                        )
-                        if to_kill:
-                            kill_pids(
-                                to_kill, name="frontend-listener", sig=signal.SIGKILL
-                            )
-                        if not wait_for_port_free(
-                            is_port_available_fn=is_port_available,
-                            port=config.dev.frontend_port,
-                            timeout=1.5,
-                            poll=0.1,
-                        ):
-                            listeners2 = find_listeners_for_port(
-                                config.dev.frontend_port
-                            )
-                            console.print(
-                                f"[red]❌ Could not free previous frontend port {config.dev.frontend_port} "
-                                f"(listening PIDs: {listeners2})[/red]"
-                            )
-                            raise Exit(code=1)
-            if config.dev.dev_server_process:
-                stop_tracked_process(
-                    TrackedProcess(
-                        pid=config.dev.dev_server_process.pid,
-                        create_time=config.dev.dev_server_process.create_time,
-                        pgid=config.dev.dev_server_process.pgid,
-                    ),
+                    tp,
                     name="dev-server",
-                    sigint_timeout=0.2,
                     sigterm_timeout=0.6,
                     sigkill_timeout=0.6,
                 )
-                wait_for_no_descendants(
-                    TrackedProcess(
-                        pid=config.dev.dev_server_process.pid,
-                        create_time=config.dev.dev_server_process.create_time,
-                        pgid=config.dev.dev_server_process.pgid,
-                    ),
-                    timeout=2.0,
-                    poll=0.1,
-                )
+                wait_for_no_descendants(tp, timeout=2.0, poll=0.1)
 
         # Find available ports
         console.print("[cyan]🔍 Finding available ports...[/cyan]")
 
-        # Find frontend/vite server port (5173-5200)
-        available_frontend_port = find_available_port(5173, 5200)
+        # Try preferred ports first if provided
+        # Use allow_reuse=True to match uvicorn's SO_REUSEADDR behavior,
+        # which allows binding to ports in TIME_WAIT state (common after restart).
+        available_dev_port: int | None = None
+        available_frontend_port: int | None = None
+        available_backend_port: int | None = None
+
+        if preferred_ports is not None:
+            if is_port_available(preferred_ports.dev_server_port, allow_reuse=True):
+                available_dev_port = preferred_ports.dev_server_port
+            if is_port_available(preferred_ports.frontend_port, allow_reuse=True):
+                available_frontend_port = preferred_ports.frontend_port
+            if is_port_available(preferred_ports.backend_port, allow_reuse=True):
+                available_backend_port = preferred_ports.backend_port
+
+        # Find dev server port (7000-7999) if preferred not available
+        if available_dev_port is None:
+            available_dev_port = find_available_port(
+                DEV_SERVER_PORT_START, DEV_SERVER_PORT_END
+            )
+        if available_dev_port is None:
+            console.print(
+                f"[red]❌ No available ports found for dev server in range {DEV_SERVER_PORT_START}-{DEV_SERVER_PORT_END}[/red]"
+            )
+            raise Exit(code=1)
+
+        # Find frontend/vite server port (5000-5999) if preferred not available
+        if available_frontend_port is None:
+            available_frontend_port = find_available_port(
+                FRONTEND_PORT_START, FRONTEND_PORT_END
+            )
         if available_frontend_port is None:
             console.print(
-                "[red]❌ No available ports found for frontend server in range 5173-5200[/red]"
+                f"[red]❌ No available ports found for frontend server in range {FRONTEND_PORT_START}-{FRONTEND_PORT_END}[/red]"
             )
             raise Exit(code=1)
 
-        # Find backend/app server port (8000-8040)
-        available_backend_port = find_available_port(8000, 8040)
+        # Find backend/app server port (8000-8999) if preferred not available
+        if available_backend_port is None:
+            available_backend_port = find_available_port(
+                BACKEND_PORT_START, BACKEND_PORT_END
+            )
         if available_backend_port is None:
             console.print(
-                "[red]❌ No available ports found for backend server in range 8000-8040[/red]"
+                f"[red]❌ No available ports found for backend server in range {BACKEND_PORT_START}-{BACKEND_PORT_END}[/red]"
             )
             raise Exit(code=1)
 
-        # Use the found ports instead of the provided/default values
-        frontend_port = available_frontend_port
-        backend_port = available_backend_port
+        # Update config with discovered ports
+        config = DevServerConfig(
+            ports=PortsConfig(
+                dev_server_port=available_dev_port,
+                frontend_port=available_frontend_port,
+                backend_port=available_backend_port,
+            ),
+            host=config.host,
+            api_prefix=config.api_prefix,
+            obo=config.obo,
+            openapi=config.openapi,
+            max_retries=config.max_retries,
+            watch=config.watch,
+        )
 
         console.print(
-            f"[green]✓[/green] Found available ports - Frontend: {frontend_port}, Backend: {backend_port}"
+            f"[green]✓[/green] Found available ports - Dev: {config.dev_server_port}, Frontend: {config.frontend_port}, Backend: {config.backend_port}"
         )
         console.print()
 
         mode_msg = (
             "🚀 Starting development server in watch mode..."
-            if watch
+            if config.watch
             else "🚀 Starting development server in detached mode..."
         )
 
         console.print(f"[bold chartreuse1]{mode_msg}[/bold chartreuse1]")
-        console.print(f"[cyan]Dev Socket:[/cyan] {self.socket_path}")
-        console.print(f"[cyan]Frontend:[/cyan] http://localhost:{frontend_port}")
-        console.print(f"[green]Backend:[/green] http://{host}:{backend_port}")
+        console.print(
+            f"[cyan]Dev Server:[/cyan] http://{config.host}:{config.dev_server_port}"
+        )
+        console.print(
+            f"[cyan]  └─ Frontend:[/cyan] http://{config.host}:{config.frontend_port} (internal)"
+        )
+        console.print(
+            f"[cyan]  └─ Backend:[/cyan] http://{config.host}:{config.backend_port} (internal)"
+        )
+        console.print(f"[cyan]  └─ API Prefix:[/cyan] {config.api_prefix}")
         console.print()
 
         # Start the dev server process
@@ -1130,13 +1175,14 @@ class DevManager:
                 "dev",
                 "_run_server",
                 str(self.app_dir),
-                str(self.socket_path),
-                str(frontend_port),
-                str(backend_port),
-                host,
-                str(obo).lower(),
-                str(openapi).lower(),
-                str(max_retries),
+                str(config.dev_server_port),
+                str(config.frontend_port),
+                str(config.backend_port),
+                config.host,
+                config.api_prefix,
+                str(config.obo).lower(),
+                str(config.openapi).lower(),
+                str(config.max_retries),
             ],
             cwd=self.app_dir,
             stdin=subprocess.DEVNULL,
@@ -1145,37 +1191,27 @@ class DevManager:
             **popen_kwargs,
         )
 
-        # Persist dev server process metadata into project.json for robust stop fallback.
-        dev_tp = track_process(dev_server_proc.pid)
-        config = self.get_or_create_config()
-        config.dev.host = host
-        config.dev.frontend_port = frontend_port
-        config.dev.backend_port = backend_port
-        if dev_tp is not None:
-            config.dev.dev_server_process = DevProcessInfo(
-                pid=dev_tp.pid,
-                create_time=dev_tp.create_time,
-                pgid=dev_tp.pgid,
-            )
-        else:
-            config.dev.dev_server_process = None
-        config.dev.frontend_process = None
-        write_project_config(self.project_json_path, config)
+        # Persist dev server process metadata into project.json
+        project_config = self.get_or_create_config()
+        project_config.dev.dev_server_pid = dev_server_proc.pid
+        project_config.dev.dev_server_port = config.dev_server_port
+        project_config.dev.api_prefix = config.api_prefix
+        write_project_config(self.project_json_path, project_config)
 
-        console.print("[cyan]✓[/cyan] Dev server started")
+        console.print("[cyan]✓[/cyan] Dev server process started")
         console.print()
 
-        # Wait a moment for server to start and create socket
-        max_wait = 5  # seconds
+        # Wait for dev server to be ready
+        max_wait = 10  # seconds
+        client = DevServerClient(port=config.dev_server_port, timeout=2.0)
         for _ in range(max_wait * 10):
-            if self.socket_path.exists():
+            if client.is_running():
                 break
             time.sleep(0.1)
         else:
             console.print(
-                "[red]❌ Dev server did not create socket within timeout[/red]"
+                "[red]❌ Dev server did not become ready within timeout[/red]"
             )
-            # Try to kill the process if it's still running
             try:
                 dev_server_proc.terminate()
                 dev_server_proc.wait(timeout=2)
@@ -1183,18 +1219,9 @@ class DevManager:
                 pass
             raise Exit(code=1)
 
-        # Send start request to dev server using the client
-        client = DevServerClient(self.socket_path)
-
+        # Send start request to dev server
         try:
-            request = ActionRequest(
-                frontend_port=frontend_port,
-                backend_port=backend_port,
-                host=host,
-                obo=obo,
-                openapi=openapi,
-                max_retries=max_retries,
-            )
+            request = ActionRequest.from_config(config)
             response = client.start(request)
 
             if response.status == "success":
@@ -1208,21 +1235,27 @@ class DevManager:
                 f"[yellow]⚠️  Warning: Could not connect to dev server: {e}[/yellow]"
             )
 
-        if not watch:
+        console.print()
+        console.print(
+            f"[bold]Open in browser:[/bold] http://{config.host}:{config.dev_server_port}"
+        )
+        if not config.watch:
             console.print(
                 "[dim]Run 'apx dev status' to check status or 'apx dev stop' to stop the servers.[/dim]"
             )
 
     def status(self):
         """Check the status of development servers."""
-        # Check if dev server is running
-        if not self.is_dev_server_running():
+        config = self.get_or_create_config()
+        port = config.dev.dev_server_port
+
+        if port is None or not self.is_dev_server_running():
             console.print("[yellow]No development server found.[/yellow]")
             console.print("[dim]Run 'apx dev start' to start the server.[/dim]")
             return
 
         # Query dev server for status using the client
-        client = DevServerClient(self.socket_path)
+        client = DevServerClient(port=port)
 
         try:
             status_data = client.status()
@@ -1241,7 +1274,7 @@ class DevManager:
             table.add_row(
                 "Dev Server",
                 "[green]●[/green] Running",
-                "Unix Socket",
+                str(status_data.dev_server_port),
             )
 
             # Frontend row
@@ -1253,7 +1286,7 @@ class DevManager:
             table.add_row(
                 "Frontend",
                 frontend_status,
-                str(status_data.frontend_port),
+                f"{status_data.frontend_port} (internal)",
             )
 
             # Backend row
@@ -1265,7 +1298,7 @@ class DevManager:
             table.add_row(
                 "Backend",
                 backend_status,
-                str(status_data.backend_port),
+                f"{status_data.backend_port} (internal)",
             )
 
             # OpenAPI row
@@ -1278,7 +1311,10 @@ class DevManager:
 
             console.print(table)
             console.print()
-            console.print(f"[dim]Dev Server Socket: {self.socket_path}[/dim]")
+            console.print(f"[dim]API Prefix: {status_data.api_prefix}[/dim]")
+            console.print(
+                f"[dim]Open in browser: http://localhost:{status_data.dev_server_port}[/dim]"
+            )
             console.print(
                 "[dim]Use 'apx dev logs' to view logs or 'apx dev logs -f' to stream continuously.[/dim]"
             )
@@ -1289,145 +1325,77 @@ class DevManager:
         """Stop development server.
 
         Stops servers deterministically by targeting only processes we started.
+        Uses graceful shutdown sequence:
+        1. Stop accepting new connections (proxy)
+        2. Close WebSocket connections
+        3. Stop frontend process
+        4. Stop backend task
         """
-        if not self.is_dev_server_running():
+        config = self.get_or_create_config()
+        port = config.dev.dev_server_port
+
+        if port is None:
             console.print("[yellow]No development server found.[/yellow]")
             return
 
         console.print("[bold yellow]Stopping development server...[/bold yellow]")
 
-        # Capture project.json state early (dev server may be unresponsive / exiting).
-        config_before = self.get_or_create_config()
-        frontend_port = config_before.dev.frontend_port
-        backend_port = config_before.dev.backend_port
-
-        # Try to send stop request to dev server first (graceful stop path).
-        client = DevServerClient(self.socket_path)
+        # Try to send stop request to dev server first (graceful stop path)
+        client = DevServerClient(port=port, timeout=15.0)
 
         try:
-            response = client.stop()
-            if response.status == "success":
-                console.print("[green]✓[/green] Stopped all servers via API")
+            if client.is_running():
+                response = client.stop()
+                if response.status == "success":
+                    console.print("[green]✓[/green] Stopped all servers via API")
+                else:
+                    raise RuntimeError(response.message)
             else:
-                raise RuntimeError(response.message)
+                raise RuntimeError("Dev server not responding")
         except Exception as e:
-            # API path failed; fall back to project.json-targeted shutdown.
+            # API path failed; fall back to PID-based shutdown
             console.print(
                 f"[yellow]⚠️  Dev server API stop failed; falling back to process cleanup: {e}[/yellow]"
             )
-            config = self.get_or_create_config()
-            did_any = False
-            if config.dev.frontend_process:
-                stop_tracked_process(
-                    TrackedProcess(
-                        pid=config.dev.frontend_process.pid,
-                        create_time=config.dev.frontend_process.create_time,
-                        pgid=config.dev.frontend_process.pgid,
-                    ),
-                    name="frontend",
-                    sigint_timeout=0.2,
-                    sigterm_timeout=0.6,
-                    sigkill_timeout=0.6,
-                )
-                wait_for_no_descendants(
-                    TrackedProcess(
-                        pid=config.dev.frontend_process.pid,
-                        create_time=config.dev.frontend_process.create_time,
-                        pgid=config.dev.frontend_process.pgid,
-                    ),
-                    timeout=2.0,
-                    poll=0.1,
-                )
-                did_any = True
 
-            if config.dev.dev_server_process:
-                stop_tracked_process(
-                    TrackedProcess(
-                        pid=config.dev.dev_server_process.pid,
-                        create_time=config.dev.dev_server_process.create_time,
-                        pgid=config.dev.dev_server_process.pgid,
-                    ),
-                    name="dev-server",
-                    sigint_timeout=0.2,
-                    sigterm_timeout=0.6,
-                    sigkill_timeout=0.6,
-                )
-                wait_for_no_descendants(
-                    TrackedProcess(
-                        pid=config.dev.dev_server_process.pid,
-                        create_time=config.dev.dev_server_process.create_time,
-                        pgid=config.dev.dev_server_process.pgid,
-                    ),
-                    timeout=2.0,
-                    poll=0.1,
-                )
-                did_any = True
-
-            if not did_any:
-                # Last-resort: only attempt to stop the dev server process by cmdline.
-                # We intentionally do NOT kill bun/vite/node by name.
+            if config.dev.dev_server_pid is not None:
+                tp = track_process(config.dev.dev_server_pid)
+                if tp is not None:
+                    stop_tracked_process(
+                        tp,
+                        name="dev-server",
+                        sigterm_timeout=1.0,
+                        sigkill_timeout=1.0,
+                    )
+                    wait_for_no_descendants(tp, timeout=3.0, poll=0.1)
+                else:
+                    # Process doesn't exist with same create_time, try by PID only
+                    try:
+                        os.kill(config.dev.dev_server_pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+            else:
+                # Last resort
                 cleanup_dev_server_processes(self.app_dir, silent=True)
 
-        # Wait for socket to be removed (whether by API or by our cleanup)
-        max_wait = 3  # seconds
-        for _ in range(max_wait * 10):
-            if not self.socket_path.exists():
-                break
-            time.sleep(0.1)
-
-        # Force remove socket if it still exists
-        if self.socket_path.exists():
-            self.socket_path.unlink(missing_ok=True)
-
-        # Verify ports are free (from captured pidfile if available).
-        if frontend_port is not None:
+        # Wait for port to be free
+        if port is not None:
             if not wait_for_port_free(
                 is_port_available_fn=is_port_available,
-                port=frontend_port,
-                timeout=2.0,
+                port=port,
+                timeout=5.0,
                 poll=0.1,
             ):
-                listeners = find_listeners_for_port(frontend_port)
-                expected_pgid = (
-                    config_before.dev.frontend_process.pgid
-                    if config_before.dev.frontend_process is not None
-                    else None
-                )
-                to_kill = pids_belong_to_app(
-                    listeners, app_dir=self.app_dir, expected_pgid=expected_pgid
-                )
-                if to_kill:
-                    kill_pids(to_kill, name="frontend-listener", sig=signal.SIGKILL)
-                if not wait_for_port_free(
-                    is_port_available_fn=is_port_available,
-                    port=frontend_port,
-                    timeout=1.5,
-                    poll=0.1,
-                ):
-                    listeners2 = find_listeners_for_port(frontend_port)
+                listeners = find_listeners_for_port(port)
+                if listeners and len(listeners) > 0:
                     console.print(
-                        f"[red]❌ Frontend port {frontend_port} is still in use "
-                        f"(listening PIDs: {listeners2})[/red]"
+                        f"[yellow]⚠️  Dev server port {port} still in use (PIDs: {listeners})[/yellow]"
                     )
-                    raise Exit(code=1)
-        if backend_port is not None:
-            if not wait_for_port_free(
-                is_port_available_fn=is_port_available,
-                port=backend_port,
-                timeout=2.0,
-                poll=0.1,
-            ):
-                listeners = find_listeners_for_port(backend_port)
-                console.print(
-                    f"[red]❌ Backend port {backend_port} is still in use "
-                    f"(listening PIDs: {listeners})[/red]"
-                )
-                raise Exit(code=1)
 
-        # Clear stored process metadata (token_id remains).
+        # Clear stored process metadata (token_id remains)
         config = self.get_or_create_config()
-        config.dev.dev_server_process = None
-        config.dev.frontend_process = None
+        config.dev.dev_server_pid = None
+        config.dev.dev_server_port = None
         write_project_config(self.project_json_path, config)
 
         console.print()
@@ -1443,6 +1411,7 @@ class DevManager:
         backend_only: bool = False,
         openapi_only: bool = False,
         app_only: bool = False,
+        system_only: bool = False,
         raw_output: bool = False,
         follow: bool = False,
         timeout_seconds: int | None = None,
@@ -1453,43 +1422,53 @@ class DevManager:
             duration_seconds: Show logs from last N seconds (None = all logs from buffer)
             ui_only: Only show frontend logs
             backend_only: Only show backend logs
-            openapi_only: Only show OpenAPI logs
+            openapi_only: Only show OpenAPI logs (subset of system logs)
             app_only: Only show application logs (from your app code)
+            system_only: Only show system logs ([apx])
             raw_output: Show raw log output without prefix formatting
             follow: Continue streaming new logs (like tail -f). If False, exits after initial logs.
             timeout_seconds: Stop streaming after N seconds (None = indefinite)
         """
-        if not self.is_dev_server_running():
+        config = self.get_or_create_config()
+        port = config.dev.dev_server_port
+
+        if port is None or not self.is_dev_server_running():
             console.print("[yellow]No development server found.[/yellow]")
             return
 
-        # Determine process filter
-        # Note: app_only is handled client-side because it's a subset of backend logs
-        process_filter: Literal["frontend", "backend", "openapi", "all"] = "all"
-        if ui_only and not backend_only and not openapi_only and not app_only:
-            process_filter = "frontend"
-        elif backend_only and not ui_only and not openapi_only and not app_only:
-            process_filter = "backend"
-        elif openapi_only and not ui_only and not backend_only and not app_only:
-            process_filter = "openapi"
-        elif app_only and not ui_only and not backend_only and not openapi_only:
-            # For app-only, we need backend logs and will filter client-side
-            process_filter = "backend"
+        channel_filter: Literal["app", "ui", "apx", "all"] = "all"
+        component_filter: str | None = None
+        include_system = False
+
+        # `--system` (or system_only) means show only [apx].
+        if system_only:
+            channel_filter = "apx"
+        elif openapi_only:
+            channel_filter = "apx"
+            component_filter = "openapi"
+        elif ui_only:
+            channel_filter = "ui"
+        elif backend_only:
+            channel_filter = "app"
+        elif app_only:
+            channel_filter = "app"
+            component_filter = "app"
 
         # Connect to SSE endpoint using the client
-        client = DevServerClient(self.socket_path)
+        client = DevServerClient(port=port)
 
-        log_count = 0  # Initialize early to avoid unbound error
+        log_count = 0
 
         try:
             with client.stream_logs(
                 duration=duration_seconds,
-                process=process_filter,
+                channel=channel_filter,
+                component=component_filter,
+                include_system=include_system,
             ) as log_stream:
                 start_time = time.time()
 
                 for item in log_stream:
-                    # Check timeout
                     if (
                         timeout_seconds
                         and (time.time() - start_time) >= timeout_seconds
@@ -1500,27 +1479,15 @@ class DevManager:
                             )
                         break
 
-                    # Handle sentinel event for end of buffered logs
                     if item == StreamEvent.BUFFERED_DONE:
                         if not follow:
-                            # Stop streaming after buffered logs if not following
                             break
-                        # Otherwise, continue to stream new logs
                         continue
 
-                    # Must be a LogEntry at this point
                     if not isinstance(item, LogEntry):
                         continue
 
-                    # Client-side filtering for app-only logs
-                    if app_only:
-                        # Only show backend logs that have "APP | " prefix
-                        if item.process_name != "backend":
-                            continue
-                        if not item.content.startswith("APP | "):
-                            continue
-
-                    print_log_entry(item.model_dump(), raw_output=raw_output)
+                    print_log_entry(item, raw_output=raw_output)
                     log_count += 1
 
         except KeyboardInterrupt:
@@ -1529,7 +1496,6 @@ class DevManager:
         except Exception as e:
             console.print(f"\n[red]Error streaming logs: {e}[/red]")
 
-        # Print summary for non-follow mode
         if not follow:
             if log_count > 0:
                 console.print(f"\n[dim]Showed {log_count} log entries[/dim]")
