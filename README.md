@@ -80,10 +80,9 @@ This will launch an interactive prompt that will guide you through:
 
 The app will be created in the current working directory by default. You can specify a different path via:
 
-````
 ```bash
 uvx git+https://github.com/databricks-solutions/apx.git init /path/to/your/app
-````
+```
 
 ### ⚙️ Non-Interactive Mode
 
@@ -146,6 +145,9 @@ Initializes a new app project with interactive prompts for configuration. Suppor
 - `--profile, -p`: Specify a Databricks profile
 - `--assistant, -a`: Choose AI assistant rules (cursor/vscode/codex/claude)
 - `--layout, -l`: Choose the layout (basic/sidebar)
+- `--skip-frontend-dependencies`: Skip installing frontend dependencies (bun packages)
+- `--skip-backend-dependencies`: Skip installing backend dependencies (uv sync)
+- `--skip-build`: Skip building the project after initialization
 
 ### 🔥 `dev` - Development Server Management
 
@@ -161,13 +163,12 @@ Starts backend, frontend, and OpenAPI watcher in detached mode.
 
 Options:
 
-- `--frontend-port`: Frontend port (default: 5173)
-- `--backend-port`: Backend port (default: 8000)
 - `--host`: Host for dev, frontend, and backend servers (default: localhost)
+- `--api-prefix`: URL prefix for API routes (default: /api)
 - `--obo/--no-obo`: Enable/disable On-Behalf-Of header (default: enabled)
 - `--openapi/--no-openapi`: Enable/disable OpenAPI watcher (default: enabled)
 - `--max-retries`: Maximum number of retry attempts for processes (default: 10)
-- `--watch`: Start servers and tail logs until Ctrl+C, then stop all servers
+- `--watch, -w`: Start servers and tail logs until Ctrl+C, then stop all servers
 
 #### Check Server Status
 
@@ -188,26 +189,21 @@ Displays historical logs from development servers.
 Options:
 
 - `--duration, -d`: Show logs from last N seconds
+- `--follow, -f`: Follow log output (like tail -f). Streams new logs continuously.
 - `--ui`: Show only frontend logs
 - `--backend`: Show only backend logs
 - `--openapi`: Show only OpenAPI logs
+- `--app`: Show only application logs (from your app code)
+- `--system`: Show only system logs from the apx dev server
+- `--raw`: Show raw log output without prefix formatting
 
-#### Tail Logs
+#### Restart Development Servers
 
 ```bash
-uv run apx dev logs -f
+uv run apx dev restart
 ```
 
-Continuously streams logs from development servers.
-
-Options:
-
-- `--duration, -d`: Initially show logs from last N seconds
-- `--timeout, -t`: Stop tailing after N seconds
-- `--ui`: Show only frontend logs
-- `--backend`: Show only backend logs
-- `--app`: Show only app logs
-- `--raw`: Show raw log output without prefix formatting
+Restarts all running development servers, attempting to reuse the same ports.
 
 #### Stop Development Servers
 
@@ -217,6 +213,30 @@ uv run apx dev stop
 
 Stops all running development servers.
 
+#### Check Project Code
+
+```bash
+uv run apx dev check
+```
+
+Checks the project code for errors using TypeScript compiler and basedpyright.
+
+#### MCP Server
+
+```bash
+uv run apx dev mcp
+```
+
+Starts MCP server that provides tools for managing development servers. The MCP server runs over stdio and provides tools for start, restart, stop, status, and get_metadata operations.
+
+#### Apply Addon
+
+```bash
+uv run apx dev apply
+```
+
+Applies an addon to an existing project.
+
 ### 📦 `build`
 
 ```bash
@@ -225,15 +245,25 @@ uv run apx build
 
 Prepares the app for deployment by building both frontend assets and Python wheel.
 
+Options:
+
+- `--build-path`: Path to the build directory where artifacts will be placed, relative to the app path (default: .build)
+- `--skip-ui-build`: Skip the UI build step
+
 ### 🔧 `openapi`
 
 ```bash
 uv run apx openapi
 ```
 
-Manually generates OpenAPI schema and orval client. Use `--watch` to enable automatic regeneration on changes.
+Manually generates OpenAPI schema and orval client.
 
-Note: you don't need to run this command manually, watcher will run automatically when you start the development server.
+Options:
+
+- `--watch, -w`: Watch for changes and regenerate automatically
+- `--force, -f`: Force regeneration even if schema hasn't changed
+
+Note: you don't need to run this command manually, the watcher will run automatically when you start the development server.
 
 ### 📝 `shadcn` directory repositories
 
