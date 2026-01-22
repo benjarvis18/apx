@@ -17,10 +17,64 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from typer import Exit
 from typing_extensions import override
 
-# Configure console to handle encoding errors gracefully on Windows
-# Use legacy_windows=False to enable modern Windows console APIs that support UTF-8
-# This allows emojis and other Unicode characters to be displayed properly
-console = Console(legacy_windows=False)
+# Emoji to ASCII replacements for Windows compatibility
+_EMOJI_REPLACEMENTS = {
+    "🔧": "[BUILD]",
+    "🎨": "[UI]",
+    "✅": "[OK]",
+    "❌": "[FAIL]",
+    "⏭️": "[SKIP]",
+    "🐍": "[PYTHON]",
+    "💡": "[INFO]",
+    "⚠️": "[WARN]",
+    "📦": "[PKG]",
+    "📁": "[DIR]",
+    "📝": "[DOC]",
+}
+
+
+def _sanitize_text(text: str) -> str:
+    """Replace emojis with ASCII alternatives for Windows compatibility."""
+    result = text
+    for emoji, replacement in _EMOJI_REPLACEMENTS.items():
+        result = result.replace(emoji, replacement)
+    return result
+
+
+class SafeConsole(Console):
+    """A Console that handles encoding errors by replacing emojis with ASCII alternatives."""
+
+    def print(self, *objects: object, **kwargs) -> None:
+        """Override print to handle encoding errors gracefully."""
+        # Check the encoding of the output file
+        file = kwargs.get("file", self._file)
+        encoding = getattr(file, "encoding", None) or "utf-8"
+
+        # If encoding is not UTF-8, sanitize strings before passing to Rich
+        # This prevents encoding errors during Rich's internal rendering
+        if encoding.lower() not in ("utf-8", "utf8"):
+            sanitized_objects = []
+            for obj in objects:
+                if isinstance(obj, str):
+                    sanitized_objects.append(_sanitize_text(obj))
+                else:
+                    sanitized_objects.append(obj)
+            objects = sanitized_objects
+
+        # Try to print, with fallback sanitization if encoding error occurs
+        try:
+            return super().print(*objects, **kwargs)
+        except UnicodeEncodeError:
+            # Fallback: sanitize all string objects and retry
+            sanitized = tuple(
+                _sanitize_text(str(obj)) if isinstance(obj, str) else obj
+                for obj in objects
+            )
+            return super().print(*sanitized, **kwargs)
+
+
+# Configure console with modern Windows APIs and encoding error handling
+console = SafeConsole(legacy_windows=False)
 
 
 def format_elapsed_ms(start_time_perf: float) -> str:
