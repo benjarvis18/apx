@@ -17,7 +17,10 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from typer import Exit
 from typing_extensions import override
 
-console = Console()
+# Configure console to handle encoding errors gracefully on Windows
+# Use legacy_windows=False to enable modern Windows console APIs that support UTF-8
+# This allows emojis and other Unicode characters to be displayed properly
+console = Console(legacy_windows=False)
 
 
 def format_elapsed_ms(start_time_perf: float) -> str:
