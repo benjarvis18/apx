@@ -27,7 +27,7 @@ function Index() {
 
           {/* APX Card Button - Bottom Right */}
           <a
-            href="https://github.com/databricks-solutions/apx"
+            href="https://github.com/benjarvis18/apx"
             target="_blank"
             rel="noopener noreferrer"
             className="absolute bottom-12 right-2 w-38 group"

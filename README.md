@@ -1,5 +1,5 @@
 <p align="center">
-    <a href="https://github.com/databricks-solutions/apx">
+    <a href="https://github.com/benjarvis18/apx">
         <img src="https://raw.githubusercontent.com/databricks-solutions/apx/refs/heads/main/assets/logo.svg" class="align-center" width="200" height="200" alt="logo" />
     </a>
 </p>
@@ -32,7 +32,7 @@
 1. Run the command to initialize the project:
 
 ```bash
-uvx git+https://github.com/databricks-solutions/apx.git init
+uvx git+https://github.com/benjarvis18/apx.git init
 ```
 
 2. Open the project in Cursor (or any IDE of your choice, for that matter), allow usage of apx and shadcn mcp
@@ -69,7 +69,7 @@ To kickstart your app, please make sure you have:
 Then you can use the following command:
 
 ```bash
-uvx git+https://github.com/databricks-solutions/apx.git init
+uvx git+https://github.com/benjarvis18/apx.git init
 ```
 
 This will launch an interactive prompt that will guide you through:
@@ -81,7 +81,7 @@ This will launch an interactive prompt that will guide you through:
 The app will be created in the current working directory by default. You can specify a different path via:
 
 ```bash
-uvx git+https://github.com/databricks-solutions/apx.git init /path/to/your/app
+uvx git+https://github.com/benjarvis18/apx.git init /path/to/your/app
 ```
 
 ### ⚙️ Non-Interactive Mode
@@ -89,7 +89,7 @@ uvx git+https://github.com/databricks-solutions/apx.git init /path/to/your/app
 You can also specify all options via command-line flags to skip the prompts:
 
 ```bash
-uvx https://github.com/databricks-solutions/apx.git init \
+uvx https://github.com/benjarvis18/apx.git init \
   --name my-app \
   --template essential \
   --profile my-profile \
@@ -153,7 +153,7 @@ This will pull the latest changes from the main branch and update the `apx` pack
 ### 🚀 `init`
 
 ```bash
-uvx git+https://github.com/databricks-solutions/apx.git init [APP_PATH]
+uvx git+https://github.com/benjarvis18/apx.git init [APP_PATH]
 ```
 
 Initializes a new app project with interactive prompts for configuration. Supports optional flags to skip prompts:

@@ -238,10 +238,11 @@ def process_template_directory(
 
             # Replace 'base' with app_slug in the path (for module names and paths)
             path_str = str(rel_path)
-            if "/base/" in path_str or path_str.startswith("base/"):
-                path_str = path_str.replace("/base/", f"/{app_slug}/").replace(
-                    "base/", f"{app_slug}/"
-                )
+
+            # Cross-platform replacement for 'base' as a directory component with app_slug
+            path_parts = rel_path.parts
+            new_parts = [app_slug if part == "base" else part for part in path_parts]
+            path_str = str(Path(*new_parts))
 
             # Determine target path
             if item.suffix == ".jinja2":

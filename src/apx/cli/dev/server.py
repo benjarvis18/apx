@@ -244,11 +244,11 @@ async def stop_children(*, verify_ports: bool = True) -> list[str]:
                     remaining = find_listeners_for_port(state.frontend_port)
                     if remaining:
                         kill_pids(
-                            remaining, name="orphaned-frontend", sig=signal.SIGKILL
+                            remaining, name="orphaned-frontend", sig=signal.SIGILL
                         )
                         await asyncio.sleep(0.3)
             else:
-                kill_pids(orphan_pids, name="orphaned-frontend", sig=signal.SIGKILL)
+                kill_pids(orphan_pids, name="orphaned-frontend", sig=signal.SIGILL)
                 await asyncio.sleep(0.3)
 
     # === Step 4: Stop backend task ===
@@ -298,7 +298,7 @@ async def stop_children(*, verify_ports: bool = True) -> list[str]:
             await asyncio.sleep(0.5)
             remaining = find_listeners_for_port(state.backend_port)
             if remaining:
-                kill_pids(remaining, name="orphaned-backend", sig=signal.SIGKILL)
+                kill_pids(remaining, name="orphaned-backend", sig=signal.SIGILL)
                 await asyncio.sleep(0.3)
 
     # === Step 7: Verify ports are free (optional) ===
@@ -318,7 +318,7 @@ async def stop_children(*, verify_ports: bool = True) -> list[str]:
                 pids = find_listeners_for_port(port)
                 if pids:
                     logger.error(f"{port_name} port {port} still in use: {pids}")
-                    kill_pids(pids, name=f"{port_name}-port-hog", sig=signal.SIGKILL)
+                    kill_pids(pids, name=f"{port_name}-port-hog", sig=signal.SIGILL)
                     if not wait_for_port_free(
                         is_port_available_fn=is_port_available,
                         port=port,

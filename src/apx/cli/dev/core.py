@@ -394,7 +394,7 @@ def kill_process_group(
     )
 
     try:
-        _send_posix_signal_group(pgid, signal.SIGKILL)
+        _send_posix_signal_group(pgid, signal.SIGILL)
         logger.debug(f"Sent SIGKILL to pgid={pgid}")
     except ProcessLookupError:
         return True
@@ -412,7 +412,7 @@ def kill_process_group(
         logger.debug(f"Killing {len(stragglers)} stragglers individually: {stragglers}")
         for pid in stragglers:
             try:
-                os.kill(pid, signal.SIGKILL)
+                os.kill(pid, signal.SIGILL)
             except Exception:
                 pass
         time.sleep(0.2)
@@ -556,7 +556,7 @@ def stop_tracked_process(
 
 
 def kill_pids(
-    pids: list[int], *, name: str = "process", sig: signal.Signals = signal.SIGKILL
+    pids: list[int], *, name: str = "process", sig: signal.Signals = signal.SIGILL
 ) -> int:
     """Best-effort kill for a list of PIDs (POSIX/Windows). Returns count attempted."""
     killed = 0
